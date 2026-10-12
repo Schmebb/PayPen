@@ -2,26 +2,54 @@ package com.schmebb.ledger;
 
 import java.time.Clock;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * A double-entry ledger. Every posted transaction's entries sum to zero, so money only
  * ever moves between accounts — it is never created or destroyed.
+ *
+ * <p>Append-only. Posted transactions are never edited or deleted; a mistake is corrected by
+ * {@link #reverse(String) reversing} it, which leaves both the mistake and the fix in the history.
+ *
+ * <p>Thread-safe. Each account has its own lock; a transaction locks every account it touches,
+ * always in account-id order, so transfers on unrelated accounts run in parallel and two
+ * transfers in opposite directions can never deadlock.
  */
 public final class Ledger {
 
     /** System account that opening balances are drawn from. Goes negative as money is issued. */
     public static final String FUNDING = "FUNDING";
 
+    private static final class AccountState {
+        final Account account;
+        final ReentrantLock lock = new ReentrantLock();
+        /** Guarded by {@link #lock}. */
+        final List<Entry> entries = new ArrayList<>();
+        /**
+         * Running total of {@link #entries}, kept so a balance read is O(1) instead of re-summing
+         * the whole history. Guarded by {@link #lock}, and only ever changed alongside an append.
+         */
+        long balance;
+
+        AccountState(Account account) {
+            this.account = account;
+        }
+
+        /** Caller must hold {@link #lock}. */
+        void append(Entry entry) {
+            entries.add(entry);
+            balance += entry.amountCents();
+        }
+    }
+
     private final Clock clock;
-    private final Map<String, Account> accounts = new HashMap<>();
-    private final List<Transaction> transactions = new ArrayList<>();
-    private final Set<String> transactionIds = new HashSet<>();
+    private final Map<String, AccountState> accounts = new ConcurrentHashMap<>();
+    private final Map<String, Transaction> transactionsById = new ConcurrentHashMap<>();
 
     public Ledger() {
         this(Clock.systemUTC());
@@ -33,21 +61,24 @@ public final class Ledger {
     }
 
     public Account openAccount(String id, AccountType type) {
-        if (accounts.containsKey(id)) {
+        Account account = new Account(id, type, false);
+        if (accounts.putIfAbsent(id, new AccountState(account)) != null) {
             throw new LedgerException("Account already exists: " + id);
         }
-        Account account = new Account(id, type, false);
-        accounts.put(id, account);
         return account;
     }
 
     /**
      * Records a transaction, or throws {@link LedgerException} and records nothing.
      * All checks run before anything is written, so a rejected transaction leaves no trace.
+     *
+     * <p>Idempotent: posting an id that already exists returns the original transaction and
+     * changes nothing, so a retried payment is never applied twice.
      */
-    public void post(Transaction transaction) {
-        if (transactionIds.contains(transaction.id())) {
-            throw new LedgerException("Duplicate transaction id: " + transaction.id());
+    public Transaction post(Transaction transaction) {
+        Transaction existing = transactionsById.get(transaction.id());
+        if (existing != null) {
+            return existing;
         }
         List<Entry> entries = transaction.entries();
         if (entries.size() < 2) {
@@ -68,44 +99,96 @@ public final class Ledger {
             throw new LedgerException("Entries must sum to zero, got " + sum);
         }
 
-        for (Map.Entry<String, Long> change : changes.entrySet()) {
-            Account account = accounts.get(change.getKey());
-            long balance = balance(account.id());
-            if (account.type() == AccountType.CUSTOMER && balance + change.getValue() < 0) {
-                throw new InsufficientFundsException(account.id(), balance, change.getValue());
+        // Fixed lock order (sorted by id) is what prevents deadlock: two threads can never
+        // each hold a lock the other is waiting for.
+        List<AccountState> touched = changes.keySet().stream().sorted().map(accounts::get).toList();
+        for (AccountState state : touched) {
+            state.lock.lock();
+        }
+        try {
+            // Balances are read under the locks, so they can't change between check and write.
+            for (AccountState state : touched) {
+                long balance = state.balance;
+                long change = changes.get(state.account.id());
+                if (state.account.type() == AccountType.CUSTOMER && balance + change < 0) {
+                    throw new InsufficientFundsException(state.account.id(), balance, change);
+                }
+            }
+            // Claim the id last: a concurrent post of the same id may have won while we waited.
+            existing = transactionsById.putIfAbsent(transaction.id(), transaction);
+            if (existing != null) {
+                return existing;
+            }
+            for (Entry entry : entries) {
+                accounts.get(entry.accountId()).append(entry);
+            }
+            return transaction;
+        } finally {
+            for (int i = touched.size() - 1; i >= 0; i--) {
+                touched.get(i).lock.unlock();
             }
         }
-
-        transactions.add(transaction);
-        transactionIds.add(transaction.id());
     }
 
     /** Moves {@code amountCents} from one account to another as a two-entry transaction. */
-    public void transfer(String from, String to, long amountCents, String txId) {
+    public Transaction transfer(String from, String to, long amountCents, String txId) {
         if (amountCents <= 0) {
             throw new LedgerException("Transfer amount must be positive, got " + amountCents);
         }
         if (from.equals(to)) {
             throw new LedgerException("Cannot transfer from an account to itself: " + from);
         }
-        post(new Transaction(txId, clock.instant(), List.of(
+        return post(new Transaction(txId, clock.instant(), List.of(
                 new Entry(from, -amountCents),
                 new Entry(to, amountCents))));
     }
 
+    /**
+     * Undoes a posted transaction by posting its exact opposite, with id {@code txId + ":reversal"}.
+     * The original stays in the history. Idempotent: reversing the same transaction twice returns
+     * the first reversal. Fails with {@link InsufficientFundsException} if a customer has already
+     * spent the money being taken back.
+     */
+    public Transaction reverse(String txId) {
+        Transaction original = transaction(txId)
+                .orElseThrow(() -> new LedgerException("Unknown transaction: " + txId));
+        List<Entry> opposite = original.entries().stream()
+                .map(entry -> new Entry(entry.accountId(), -entry.amountCents()))
+                .toList();
+        return post(new Transaction(txId + ":reversal", clock.instant(), opposite));
+    }
+
+    public Optional<Transaction> transaction(String txId) {
+        return Optional.ofNullable(transactionsById.get(txId));
+    }
+
+    /** Every entry ever posted against the account, oldest first. */
+    public List<Entry> entries(String accountId) {
+        AccountState state = state(accountId);
+        state.lock.lock();
+        try {
+            return List.copyOf(state.entries);
+        } finally {
+            state.lock.unlock();
+        }
+    }
+
     /** The account's balance in cents: the sum of every entry ever posted against it. */
     public long balance(String accountId) {
-        if (!accounts.containsKey(accountId)) {
+        AccountState state = state(accountId);
+        state.lock.lock();
+        try {
+            return state.balance;
+        } finally {
+            state.lock.unlock();
+        }
+    }
+
+    private AccountState state(String accountId) {
+        AccountState state = accounts.get(accountId);
+        if (state == null) {
             throw new LedgerException("Unknown account: " + accountId);
         }
-        long balance = 0;
-        for (Transaction transaction : transactions) {
-            for (Entry entry : transaction.entries()) {
-                if (entry.accountId().equals(accountId)) {
-                    balance += entry.amountCents();
-                }
-            }
-        }
-        return balance;
+        return state;
     }
 }
